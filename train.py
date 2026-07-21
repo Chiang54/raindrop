@@ -182,14 +182,15 @@ def calculate_psnr(img1, img2):
     return 20 * math.log10(1.0 / math.sqrt(mse.item()))
 
 # ==============================================================================
-# 6. 主訓練腳本
+# 6. 主訓練腳本 (支援分段訓練/自動接續)
 # ==============================================================================
 def train_model():
-    data_dir = 'D:/gitserver/python/raindrop/DayRainDrop_Train' 
+    data_dir = 'D:/gitserver/python/raindrop/dataset/DayRainDrop_Train' 
     save_dir = './checkpoints'
     
     batch_size = 8
-    num_epochs = 100
+    total_target_epochs = 100    # 預計訓練總輪數
+    num_epochs_per_run = 10     # 每次執行要跑幾輪
     lr = 2e-4
     crop_size = 256
 
@@ -225,21 +226,45 @@ def train_model():
     model = FastTwoStageRaindropNet(in_channels=3, base_channels=32).to(device)
     criterion = CharbonnierLoss().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=num_epochs, eta_min=1e-6)
-    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_target_epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
 
+    # ------------------ 檢查並載入歷史訓練狀態 (Resume) ------------------
+    latest_ckpt_path = os.path.join(save_dir, 'latest_model.pth')
+    start_epoch = 1
     best_psnr = 0.0
 
-    for epoch in range(1, num_epochs + 1):
+    if os.path.exists(latest_ckpt_path):
+        print(f"--> 偵測到歷史模型權重，正在讀取: {latest_ckpt_path}")
+        checkpoint = torch.load(latest_ckpt_path, map_location=device)
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if 'scaler_state_dict' in checkpoint and use_cuda:
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+        start_epoch = checkpoint['epoch'] + 1
+        best_psnr = checkpoint.get('best_psnr', 0.0)
+        print(f"--> 成功恢復進度！將從 Epoch [{start_epoch}] 開始繼續訓練。")
+
+    end_epoch = min(start_epoch + num_epochs_per_run - 1, total_target_epochs)
+
+    if start_epoch > total_target_epochs:
+        print(f"模型已完全訓練達到目標總輪數 ({total_target_epochs} Epochs)！無需繼續訓練。")
+        return
+
+    print(f"本次執行範圍: Epoch [{start_epoch:03d}] -> Epoch [{end_epoch:03d}] (共 {end_epoch - start_epoch + 1} 輪)")
+
+    # ------------------ 訓練迴圈 ------------------
+    for epoch in range(start_epoch, end_epoch + 1):
         model.train()
         epoch_loss = 0.0
         start_time = time.time()
 
-        # ---------------- 訓練階段 (帶 tqdm 進度條) ----------------
         train_pbar = tqdm(
             train_loader, 
-            desc=f"Epoch [{epoch:03d}/{num_epochs:03d}]", 
+            desc=f"Epoch [{epoch:03d}/{total_target_epochs:03d}]", 
             leave=False,
             ncols=100
         )
@@ -261,7 +286,6 @@ def train_model():
             scaler.update()
 
             epoch_loss += total_loss.item()
-            # 在進度條後方動態更新當前 Batch 的 Loss
             train_pbar.set_postfix({"Loss": f"{total_loss.item():.4f}"})
 
         scheduler.step()
@@ -281,17 +305,33 @@ def train_model():
 
         avg_psnr = val_psnr / len(val_loader)
 
-        # 印出 Epoch 總結資訊
-        print(f"Epoch [{epoch:03d}/{num_epochs:03d}] | Train Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Time: {elapsed:.1f}s")
+        print(f"Epoch [{epoch:03d}/{total_target_epochs:03d}] | Train Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Time: {elapsed:.1f}s")
 
-        if avg_psnr > best_psnr:
+        # 更新最佳 PSNR
+        is_best = avg_psnr > best_psnr
+        if is_best:
             best_psnr = avg_psnr
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'best_psnr': best_psnr,
-            }, os.path.join(save_dir, 'best_model.pth'))
-            print(f"  --> 最佳權重已更新！(Best PSNR: {best_psnr:.2f} dB)")
+
+        # 儲存最新的模型進度 (給 Resume 使用)
+        save_dict = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict() if use_cuda else None,
+            'best_psnr': best_psnr,
+        }
+        
+        # 覆蓋最新權重檔
+        torch.save(save_dict, latest_ckpt_path)
+
+        # 若創下最高分數，額外存一份 best_model.pth
+        if is_best:
+            torch.save(save_dict, os.path.join(save_dir, 'best_model.pth'))
+            print(f"  --> 創下新紀錄！最佳權重已更新 (Best PSNR: {best_psnr:.2f} dB)")
+
+    print(f"\n[完成] 本次 10 輪訓練結束！進度已儲存至 {latest_ckpt_path}")
+    print(f"下次再次執行 `python train.py` 將自動從 Epoch [{end_epoch + 1}] 繼續訓練。")
 
 if __name__ == '__main__':
     train_model()
