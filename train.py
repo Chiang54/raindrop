@@ -190,7 +190,7 @@ def train_model():
     
     batch_size = 8
     total_target_epochs = 100    # 預計訓練總輪數
-    num_epochs_per_run = 10     # 每次執行要跑幾輪
+    num_epochs_per_run = 20     # 每次執行要跑幾輪
     lr = 2e-4
     crop_size = 256
 
@@ -330,7 +330,7 @@ def train_model():
             torch.save(save_dict, os.path.join(save_dir, 'best_model.pth'))
             print(f"  --> 創下新紀錄！最佳權重已更新 (Best PSNR: {best_psnr:.2f} dB)")
 
-    print(f"\n[完成] 本次 10 輪訓練結束！進度已儲存至 {latest_ckpt_path}")
+    print(f"\n[完成] 本次 20 輪訓練結束！進度已儲存至 {latest_ckpt_path}")
     print(f"下次再次執行 `python train.py` 將自動從 Epoch [{end_epoch + 1}] 繼續訓練。")
 
 if __name__ == '__main__':
