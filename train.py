@@ -190,7 +190,7 @@ def train_model():
     
     batch_size = 8
     total_target_epochs = 100    # 預計訓練總輪數
-    num_epochs_per_run = 20     # 每次執行要跑幾輪
+    num_epochs_per_run = 30     # 每次執行要跑幾輪
     lr = 2e-4
     crop_size = 256
 
