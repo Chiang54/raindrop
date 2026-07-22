@@ -8,6 +8,7 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
+import torchvision.models as models
 from tqdm import tqdm
 
 # ==============================================================================
@@ -63,10 +64,10 @@ class NAFBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 2. 兩階段雨滴去除與去模糊模型 (Fast-TwoStageRaindropNet)
+# 2. 兩階段雨滴去除模型 (通道提升至 base_channels=64)
 # ==============================================================================
 class FastTwoStageRaindropNet(nn.Module):
-    def __init__(self, in_channels=3, base_channels=32):
+    def __init__(self, in_channels=3, base_channels=64): # 升級為 64 通道
         super().__init__()
 
         # --- Stage 1: 去除雨滴 (Drop -> Blur) ---
@@ -84,25 +85,23 @@ class FastTwoStageRaindropNet(nn.Module):
         self.s2_out = nn.Conv2d(base_channels, in_channels, 3, 1, 1)
 
     def forward(self, x):
-        # Stage 1 運算
         f1 = self.s1_in(x)
         f1_enc = self.s1_enc(f1)
         f1_b = self.s1_bottleneck(f1_enc)
         f1_dec = self.s1_dec(f1_b)
-        stage1_blur = x + self.s1_out(f1_dec)  # 預測 Blur 影像
+        stage1_blur = x + self.s1_out(f1_dec)
 
-        # Stage 2 運算 (融合 Stage 1 特徵)
         f2_in = torch.cat([f1_dec, stage1_blur], dim=1)
         f2 = self.s2_in(f2_in)
         f2_enc = self.s2_enc(f2)
         f2_b = self.s2_bottleneck(f2_enc)
         f2_dec = self.s2_dec(f2_b)
-        stage2_clear = stage1_blur + self.s2_out(f2_dec)  # 預測 Clear 影像
+        stage2_clear = stage1_blur + self.s2_out(f2_dec)
 
         return stage1_blur, stage2_clear
 
 # ==============================================================================
-# 3. 損失函數 (Charbonnier Loss)
+# 3. 損失函數 (Charbonnier + VGG16 感知損失)
 # ==============================================================================
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
@@ -113,6 +112,36 @@ class CharbonnierLoss(nn.Module):
         diff = x - y
         loss = torch.sqrt(diff * diff + (self.eps * self.eps))
         return torch.mean(loss)
+
+class VGGPerceptualLoss(nn.Module):
+    """強迫模型維護高頻質感與邊緣細節，禁止塗抹行為"""
+    def __init__(self):
+        super().__init__()
+        vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
+        # 擷取 relu1_2, relu2_2, relu3_3 視覺特徵層
+        self.slice1 = nn.Sequential(*[vgg[x] for x in range(4)])
+        self.slice2 = nn.Sequential(*[vgg[x] for x in range(4, 9)])
+        self.slice3 = nn.Sequential(*[vgg[x] for x in range(9, 16)])
+        
+        for param in self.parameters():
+            param.requires_grad = False  # 凍結 VGG 參數
+
+    def forward(self, x, y):
+        # ImageNet 正規化參數
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        y = (y - mean) / std
+
+        h_x1 = self.slice1(x)
+        h_y1 = self.slice1(y)
+        h_x2 = self.slice2(h_x1)
+        h_y2 = self.slice2(h_y1)
+        h_x3 = self.slice3(h_x2)
+        h_y3 = self.slice3(h_y2)
+
+        loss = F.l1_loss(h_x1, h_y1) + F.l1_loss(h_x2, h_y2) + F.l1_loss(h_x3, h_y3)
+        return loss
 
 # ==============================================================================
 # 4. 三層資料夾 Dataset 加載器
@@ -182,15 +211,15 @@ def calculate_psnr(img1, img2):
     return 20 * math.log10(1.0 / math.sqrt(mse.item()))
 
 # ==============================================================================
-# 6. 主訓練腳本 (支援分段訓練/自動接續)
+# 6. 主訓練腳本
 # ==============================================================================
 def train_model():
     data_dir = 'D:/gitserver/python/raindrop/dataset/DayRainDrop_Train' 
     save_dir = './checkpoints'
     
     batch_size = 8
-    total_target_epochs = 200    # 預計訓練總輪數
-    num_epochs_per_run = 20     # 每次執行要跑幾輪
+    total_target_epochs = 100
+    num_epochs_per_run = 10
     lr = 2e-4
     crop_size = 256
 
@@ -223,13 +252,18 @@ def train_model():
         num_workers=0
     )
 
-    model = FastTwoStageRaindropNet(in_channels=3, base_channels=32).to(device)
-    criterion = CharbonnierLoss().to(device)
+    # 升級至 base_channels = 64
+    model = FastTwoStageRaindropNet(in_channels=3, base_channels=64).to(device)
+    
+    # 定義雙重 Loss：Charbonnier + VGG Perceptual
+    criterion_charb = CharbonnierLoss().to(device)
+    criterion_vgg = VGGPerceptualLoss().to(device)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_target_epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
 
-    # ------------------ 檢查並載入歷史訓練狀態 (Resume) ------------------
+    # Resume 檢查
     latest_ckpt_path = os.path.join(save_dir, 'latest_model.pth')
     start_epoch = 1
     best_psnr = 0.0
@@ -237,26 +271,22 @@ def train_model():
     if os.path.exists(latest_ckpt_path):
         print(f"--> 偵測到歷史模型權重，正在讀取: {latest_ckpt_path}")
         checkpoint = torch.load(latest_ckpt_path, map_location=device)
-        
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if 'scaler_state_dict' in checkpoint and use_cuda:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-            
-        start_epoch = checkpoint['epoch'] + 1
-        best_psnr = checkpoint.get('best_psnr', 0.0)
-        print(f"--> 成功恢復進度！將從 Epoch [{start_epoch}] 開始繼續訓練。")
+        try:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scaler_state_dict' in checkpoint and use_cuda:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            start_epoch = checkpoint['epoch'] + 1
+            best_psnr = checkpoint.get('best_psnr', 0.0)
+            print(f"--> 成功恢復進度！將從 Epoch [{start_epoch}] 開始繼續訓練。")
+        except Exception as e:
+            print(f"權重結構可能因模型擴充改變，將從頭 Epoch [1] 開始訓練。")
 
     end_epoch = min(start_epoch + num_epochs_per_run - 1, total_target_epochs)
 
-    if start_epoch > total_target_epochs:
-        print(f"模型已完全訓練達到目標總輪數 ({total_target_epochs} Epochs)！無需繼續訓練。")
-        return
-
     print(f"本次執行範圍: Epoch [{start_epoch:03d}] -> Epoch [{end_epoch:03d}] (共 {end_epoch - start_epoch + 1} 輪)")
 
-    # ------------------ 訓練迴圈 ------------------
     for epoch in range(start_epoch, end_epoch + 1):
         model.train()
         epoch_loss = 0.0
@@ -277,9 +307,15 @@ def train_model():
             with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
                 pred_blur, pred_clear = model(drop)
                 
-                loss_s1 = criterion(pred_blur, blur)
-                loss_s2 = criterion(pred_clear, clear)
-                total_loss = 0.5 * loss_s1 + 1.0 * loss_s2
+                # Charbonnier 像素級損失 (調低 S1 權重)
+                loss_s1 = criterion_charb(pred_blur, blur)
+                loss_s2 = criterion_charb(pred_clear, clear)
+                
+                # VGG 感知損失 (強迫還原清晰細節與紋理)
+                loss_vgg = criterion_vgg(pred_clear, clear)
+                
+                # 總 Loss 組合
+                total_loss = 0.1 * loss_s1 + 1.0 * loss_s2 + 0.02 * loss_vgg
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -292,7 +328,7 @@ def train_model():
         elapsed = time.time() - start_time
         avg_loss = epoch_loss / len(train_loader)
 
-        # ---------------- 驗證階段 ----------------
+        # 驗證階段
         model.eval()
         val_psnr = 0.0
         with torch.no_grad():
@@ -307,12 +343,10 @@ def train_model():
 
         print(f"Epoch [{epoch:03d}/{total_target_epochs:03d}] | Train Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Time: {elapsed:.1f}s")
 
-        # 更新最佳 PSNR
         is_best = avg_psnr > best_psnr
         if is_best:
             best_psnr = avg_psnr
 
-        # 儲存最新的模型進度 (給 Resume 使用)
         save_dict = {
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
@@ -322,16 +356,13 @@ def train_model():
             'best_psnr': best_psnr,
         }
         
-        # 覆蓋最新權重檔
         torch.save(save_dict, latest_ckpt_path)
 
-        # 若創下最高分數，額外存一份 best_model.pth
         if is_best:
             torch.save(save_dict, os.path.join(save_dir, 'best_model.pth'))
             print(f"  --> 創下新紀錄！最佳權重已更新 (Best PSNR: {best_psnr:.2f} dB)")
 
-    print(f"\n[完成] 本次 20 輪訓練結束！進度已儲存至 {latest_ckpt_path}")
-    print(f"下次再次執行 `python train.py` 將自動從 Epoch [{end_epoch + 1}] 繼續訓練。")
+    print(f"\n[完成] 本次 10 輪訓練結束！進度已儲存至 {latest_ckpt_path}")
 
 if __name__ == '__main__':
     train_model()
