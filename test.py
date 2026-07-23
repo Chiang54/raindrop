@@ -7,7 +7,7 @@ import torchvision.transforms.functional as TF
 from torchvision.utils import save_image
 
 # ==============================================================================
-# 1. 模型架構定義 (必須與訓練時完全一致)
+# 1. 模型架構定義 (已同步升級至 base_channels = 64)
 # ==============================================================================
 class SimpleGate(nn.Module):
     def forward(self, x):
@@ -57,7 +57,7 @@ class NAFBlock(nn.Module):
         return x
 
 class FastTwoStageRaindropNet(nn.Module):
-    def __init__(self, in_channels=3, base_channels=32):
+    def __init__(self, in_channels=3, base_channels=64):  # ✅ 改為 64 通道
         super().__init__()
         self.s1_in = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
         self.s1_enc = NAFBlock(base_channels)
@@ -91,36 +91,37 @@ class FastTwoStageRaindropNet(nn.Module):
 # 2. 測試/推論主要邏輯
 # ==============================================================================
 def run_test():
-    # ---------------- 參數配置 ----------------
-    checkpoint_path = './checkpoints/best_model.pth'  # 最佳訓練權重檔
-    test_input_dir = 'D:/gitserver/python/raindrop/testdata/DayRainDrop_Train/Drop' # 測試圖片來源目錄
-    output_dir = './results_test'                       # 輸出結果對比圖資料夾
+    checkpoint_path = './checkpoints/best_model.pth'
+    test_input_dir = 'D:/gitserver/python/raindrop/testdata/DayRainDrop_Train/Drop'
+    output_dir = './results_test'
     
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用的推論硬體: {device}")
 
-    # 1. 載入模型結構與權重
     if not os.path.exists(checkpoint_path):
         print(f"錯誤: 找不到模型權重檔 `{checkpoint_path}`，請確認路徑或是否已完成訓練。")
         return
 
-    model = FastTwoStageRaindropNet(in_channels=3, base_channels=32).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    # ✅ 指定 base_channels=64
+    model = FastTwoStageRaindropNet(in_channels=3, base_channels=64).to(device)
+    
+    # 加入 weights_only=False 消除 FutureWarning 警告
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    print(f"成功載入權重！此權重的 Best PSNR 為: {checkpoint.get('best_psnr', 0.0):.2f} dB")
+    print(f"成功載入【最強 VGG 升級版】權重！此權重的 Best PSNR 為: {checkpoint.get('best_psnr', 0.0):.2f} dB")
 
-    # 2. 搜尋測試圖片 (抓取第一個場景資料夾下的所有 png/jpg 檔進行測試)
+    # 搜尋測試圖片
     scene_folders = sorted(os.listdir(test_input_dir))
     test_images = []
     
-    for scene in scene_folders[:9]:  # 預設抓取前 9 個場景資料夾做測試
+    for scene in scene_folders[:9]:  # 只取前 9 個場景
         scene_path = os.path.join(test_input_dir, scene)
         if os.path.isdir(scene_path):
             imgs = glob.glob(os.path.join(scene_path, '*.png')) + glob.glob(os.path.join(scene_path, '*.jpg'))
-            test_images.extend(imgs[:5]) # 每個場景抓取前 5 張照片展示
+            test_images.extend(imgs[:5])
 
     if not test_images:
         print("未找到任何測試圖片！")
@@ -128,30 +129,24 @@ def run_test():
 
     print(f"找到 {len(test_images)} 張測試圖片，開始進行雨滴與水痕去除推論...")
 
-    # 3. 進行推論與儲存視覺化結果
     with torch.no_grad():
         for idx, img_path in enumerate(test_images):
-            # 讀取並轉換圖片 Tensor
             raw_img = Image.open(img_path).convert('RGB')
             input_tensor = TF.to_tensor(raw_img).unsqueeze(0).to(device)
 
-            # 模型推論 (使用全精度或 AMP)
             _, pred_clear = model(input_tensor)
-            
-            # 將數值限制在 0~1 的合法顏色範圍
             pred_clear = torch.clamp(pred_clear, 0.0, 1.0)
 
-            # 將原始雨滴圖 (Input) 與模型還原圖 (Pred Clear) 並排拼接 (Horizontal Concatenation)
+            # 將原始圖與修復圖左右拼接
             compared_result = torch.cat([input_tensor, pred_clear], dim=3)
 
-            # 儲存對比圖
             filename = f"test_result_{idx+1:03d}.png"
             save_path = os.path.join(output_dir, filename)
             save_image(compared_result, save_path)
             
             print(f"[{idx+1}/{len(test_images)}] 已生成對比圖: {save_path}")
 
-    print(f"\n測試完成！所有兩兩對比圖（左邊：含雨滴原圖 / 右邊：模型修復結果）已儲存至 `{output_dir}` 資料夾。")
+    print(f"\n測試完成！對比圖已儲存至 `{output_dir}` 資料夾。")
 
 if __name__ == '__main__':
     run_test()
