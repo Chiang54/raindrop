@@ -11,17 +11,18 @@ import torchvision.transforms.functional as TF
 import torchvision.models as models
 from tqdm import tqdm
 
+# 開啟 TensorCore 最高效能模式 (RTX 4090 必開)
+torch.set_float32_matmul_precision('high')
+
 # ==============================================================================
-# 1. 核心輕量化模組 (SimpleGate & NAFBlock)
+# 1. 核心輕量化特徵提取模組 (NAFBlock)
 # ==============================================================================
 class SimpleGate(nn.Module):
-    """無激活函數閘控，顯著加快推論速度"""
     def forward(self, x):
         x1, x2 = x.chunk(2, dim=1)
         return x1 * x2
 
 class NAFBlock(nn.Module):
-    """輕量化高效特徵提取模組"""
     def __init__(self, c, DW_Expand=2, FFN_Expand=2):
         super().__init__()
         dw_channel = c * DW_Expand
@@ -64,90 +65,137 @@ class NAFBlock(nn.Module):
         return x
 
 # ==============================================================================
-# 2. 兩階段雨滴去除模型 (通道提升至 base_channels=64)
+# 2. 獨立深層 U-Net 骨幹網路
 # ==============================================================================
-class FastTwoStageRaindropNet(nn.Module):
-    def __init__(self, in_channels=3, base_channels=64): # 升級為 64 通道
+class DeepUNetStage(nn.Module):
+    def __init__(self, in_channels, out_channels, base_channels=64):
         super().__init__()
+        # Encoder
+        self.inc = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
+        self.enc1 = nn.Sequential(NAFBlock(base_channels), NAFBlock(base_channels))
+        
+        self.down1 = nn.Conv2d(base_channels, base_channels * 2, 2, 2)
+        self.enc2 = nn.Sequential(NAFBlock(base_channels * 2), NAFBlock(base_channels * 2))
+        
+        self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4, 2, 2)
+        self.enc3 = nn.Sequential(NAFBlock(base_channels * 4), NAFBlock(base_channels * 4))
 
-        # --- Stage 1: 去除雨滴 (Drop -> Blur) ---
-        self.s1_in = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
-        self.s1_enc = NAFBlock(base_channels)
-        self.s1_bottleneck = NAFBlock(base_channels)
-        self.s1_dec = NAFBlock(base_channels)
-        self.s1_out = nn.Conv2d(base_channels, in_channels, 3, 1, 1)
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            NAFBlock(base_channels * 4), NAFBlock(base_channels * 4)
+        )
 
-        # --- Stage 2: 去模糊與背景還原 (Blur_feat + Stage1_out -> Clear) ---
-        self.s2_in = nn.Conv2d(base_channels + in_channels, base_channels, 3, 1, 1)
-        self.s2_enc = NAFBlock(base_channels)
-        self.s2_bottleneck = NAFBlock(base_channels)
-        self.s2_dec = NAFBlock(base_channels)
-        self.s2_out = nn.Conv2d(base_channels, in_channels, 3, 1, 1)
+        # Decoder
+        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, 2)
+        self.reduce2 = nn.Conv2d(base_channels * 4, base_channels * 2, 1)
+        self.dec2 = nn.Sequential(NAFBlock(base_channels * 2), NAFBlock(base_channels * 2))
+
+        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, 2)
+        self.reduce1 = nn.Conv2d(base_channels * 2, base_channels, 1)
+        self.dec1 = nn.Sequential(NAFBlock(base_channels), NAFBlock(base_channels))
+
+        self.outc = nn.Conv2d(base_channels, out_channels, 3, 1, 1)
 
     def forward(self, x):
-        f1 = self.s1_in(x)
-        f1_enc = self.s1_enc(f1)
-        f1_b = self.s1_bottleneck(f1_enc)
-        f1_dec = self.s1_dec(f1_b)
-        stage1_blur = x + self.s1_out(f1_dec)
+        e1 = self.enc1(self.inc(x))
+        e2 = self.enc2(self.down1(e1))
+        e3 = self.enc3(self.down2(e2))
 
-        f2_in = torch.cat([f1_dec, stage1_blur], dim=1)
-        f2 = self.s2_in(f2_in)
-        f2_enc = self.s2_enc(f2)
-        f2_b = self.s2_bottleneck(f2_enc)
-        f2_dec = self.s2_dec(f2_b)
-        stage2_clear = stage1_blur + self.s2_out(f2_dec)
+        b = self.bottleneck(e3)
 
-        return stage1_blur, stage2_clear
+        d2 = self.up2(b)
+        d2 = torch.cat([d2, e2], dim=1)
+        d2 = self.dec2(self.reduce2(d2))
+
+        d1 = self.up1(d2)
+        d1 = torch.cat([d1, e1], dim=1)
+        d1 = self.dec1(self.reduce1(d1))
+
+        # 這裡不加原圖 x，因為可能是從 6 channel 壓回 3 channel
+        output = self.outc(d1) 
+        return output
 
 # ==============================================================================
-# 3. 損失函數 (Charbonnier + VGG16 感知損失)
+# 3. 雙階段究極網路 (Drop -> Blur -> Clear)
+# ==============================================================================
+class UltimateTwoStageNet(nn.Module):
+    def __init__(self, base_channels=64):
+        super().__init__()
+        # Stage 1: 輸入 Drop (3 ch)，輸出預測的 Blur (3 ch)
+        self.stage1 = DeepUNetStage(in_channels=3, out_channels=3, base_channels=base_channels)
+        
+        # Stage 2: 輸入 Drop + 預測的 Blur (6 ch)，輸出最終清晰圖 Clear (3 ch)
+        self.stage2 = DeepUNetStage(in_channels=6, out_channels=3, base_channels=base_channels)
+
+    def forward(self, x_drop):
+        # 階段一：去除雨滴，生成模糊背景
+        stage1_residual = self.stage1(x_drop)
+        pred_blur = x_drop + stage1_residual  # 殘差連線
+        
+        # 階段二：將原始雨滴圖與去雨滴後的圖融合，進行去模糊與幾何銳化
+        stage2_input = torch.cat([x_drop, pred_blur], dim=1)
+        stage2_residual = self.stage2(stage2_input)
+        pred_clear = pred_blur + stage2_residual # 基於 Blur 進行清晰化還原
+        
+        return pred_blur, pred_clear
+
+# ==============================================================================
+# 4. 複合損失函數群組
 # ==============================================================================
 class CharbonnierLoss(nn.Module):
     def __init__(self, eps=1e-3):
         super().__init__()
         self.eps = eps
-
     def forward(self, x, y):
         diff = x - y
-        loss = torch.sqrt(diff * diff + (self.eps * self.eps))
-        return torch.mean(loss)
+        return torch.mean(torch.sqrt(diff * diff + (self.eps * self.eps)))
+
+class FFTLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+    def forward(self, x, y):
+        x_fft = torch.fft.rfft2(x, norm='ortho')
+        y_fft = torch.fft.rfft2(y, norm='ortho')
+        return F.l1_loss(x_fft.real, y_fft.real) + F.l1_loss(x_fft.imag, y_fft.imag)
 
 class VGGPerceptualLoss(nn.Module):
-    """強迫模型維護高頻質感與邊緣細節，禁止塗抹行為"""
     def __init__(self):
         super().__init__()
         vgg = models.vgg16(weights=models.VGG16_Weights.DEFAULT).features
-        # 擷取 relu1_2, relu2_2, relu3_3 視覺特徵層
         self.slice1 = nn.Sequential(*[vgg[x] for x in range(4)])
         self.slice2 = nn.Sequential(*[vgg[x] for x in range(4, 9)])
         self.slice3 = nn.Sequential(*[vgg[x] for x in range(9, 16)])
-        
         for param in self.parameters():
-            param.requires_grad = False  # 凍結 VGG 參數
-
+            param.requires_grad = False
     def forward(self, x, y):
-        # ImageNet 正規化參數
         mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
         x = (x - mean) / std
         y = (y - mean) / std
+        h_x1, h_y1 = self.slice1(x), self.slice1(y)
+        h_x2, h_y2 = self.slice2(h_x1), self.slice2(h_y1)
+        h_x3, h_y3 = self.slice3(h_x2), self.slice3(h_y2)
+        return F.l1_loss(h_x1, h_y1) + F.l1_loss(h_x2, h_y2) + F.l1_loss(h_x3, h_y3)
 
-        h_x1 = self.slice1(x)
-        h_y1 = self.slice1(y)
-        h_x2 = self.slice2(h_x1)
-        h_y2 = self.slice2(h_y1)
-        h_x3 = self.slice3(h_x2)
-        h_y3 = self.slice3(h_y2)
-
-        loss = F.l1_loss(h_x1, h_y1) + F.l1_loss(h_x2, h_y2) + F.l1_loss(h_x3, h_y3)
-        return loss
+class EdgeGradientLoss(nn.Module):
+    def __init__(self):
+        super().__init__()
+        kernel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        kernel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        self.register_buffer('kernel_x', kernel_x.repeat(3, 1, 1, 1))
+        self.register_buffer('kernel_y', kernel_y.repeat(3, 1, 1, 1))
+    def forward(self, x, y):
+        grad_x_pred = F.conv2d(x, self.kernel_x, padding=1, groups=3)
+        grad_y_pred = F.conv2d(x, self.kernel_y, padding=1, groups=3)
+        grad_x_gt = F.conv2d(y, self.kernel_x, padding=1, groups=3)
+        grad_y_gt = F.conv2d(y, self.kernel_y, padding=1, groups=3)
+        return F.l1_loss(grad_x_pred, grad_x_gt) + F.l1_loss(grad_y_pred, grad_y_gt)
 
 # ==============================================================================
-# 4. 三層資料夾 Dataset 加載器
+# 5. 三檔案聯合載入 Dataset (Drop, Blur, Clear 同步增強)
 # ==============================================================================
 class TripletRaindropDataset(Dataset):
-    def __init__(self, root_dir, crop_size=256, is_train=True):
+    def __init__(self, root_dir, crop_size=384, is_train=True):
         self.crop_size = crop_size
         self.is_train = is_train
         
@@ -161,12 +209,10 @@ class TripletRaindropDataset(Dataset):
             for scene in scene_folders:
                 scene_drop_path = os.path.join(self.drop_dir, scene)
                 if os.path.isdir(scene_drop_path):
-                    img_names = sorted(os.listdir(scene_drop_path))
-                    for img_name in img_names:
+                    for img_name in sorted(os.listdir(scene_drop_path)):
                         drop_path = os.path.join(self.drop_dir, scene, img_name)
                         blur_path = os.path.join(self.blur_dir, scene, img_name)
                         clear_path = os.path.join(self.clear_dir, scene, img_name)
-                        
                         if os.path.exists(clear_path) and os.path.exists(blur_path):
                             self.image_triplets.append((drop_path, blur_path, clear_path))
 
@@ -185,25 +231,49 @@ class TripletRaindropDataset(Dataset):
         tensor_clear = TF.to_tensor(img_clear)
 
         if self.is_train:
+            # 1. 智能防護：確保原圖的長寬至少大於等於 crop_size (若太小則等比例放大)
             _, h, w = tensor_drop.shape
-            if h >= self.crop_size and w >= self.crop_size:
-                i, j, th, tw = T.RandomCrop.get_params(
-                    tensor_drop, output_size=(self.crop_size, self.crop_size)
-                )
-                tensor_drop = TF.crop(tensor_drop, i, j, th, tw)
-                tensor_blur = TF.crop(tensor_blur, i, j, th, tw)
-                tensor_clear = TF.crop(tensor_clear, i, j, th, tw)
+            if h < self.crop_size or w < self.crop_size:
+                new_h = max(h, self.crop_size)
+                new_w = max(w, self.crop_size)
+                tensor_drop = TF.resize(tensor_drop, [new_h, new_w], antialias=True)
+                tensor_blur = TF.resize(tensor_blur, [new_h, new_w], antialias=True)
+                tensor_clear = TF.resize(tensor_clear, [new_h, new_w], antialias=True)
 
+            # 2. 隨機多尺度縮放 (確保縮放後的尺寸依然大於等於 crop_size)
+            if torch.rand(1) > 0.5:
+                scale_factor = torch.empty(1).uniform_(0.75, 1.0).item()
+                _, h, w = tensor_drop.shape
+                new_h = max(int(h * scale_factor), self.crop_size)
+                new_w = max(int(w * scale_factor), self.crop_size)
+                tensor_drop = TF.resize(tensor_drop, [new_h, new_w], antialias=True)
+                tensor_blur = TF.resize(tensor_blur, [new_h, new_w], antialias=True)
+                tensor_clear = TF.resize(tensor_clear, [new_h, new_w], antialias=True)
+
+            # 3. 強制執行 RandomCrop (此時保證長寬絕對足夠，不會再有跳過裁切的問題)
+            i, j, th, tw = T.RandomCrop.get_params(
+                tensor_drop, output_size=(self.crop_size, self.crop_size)
+            )
+            tensor_drop = TF.crop(tensor_drop, i, j, th, tw)
+            tensor_blur = TF.crop(tensor_blur, i, j, th, tw)
+            tensor_clear = TF.crop(tensor_clear, i, j, th, tw)
+
+            # 4. 隨機水平翻轉
             if torch.rand(1) > 0.5:
                 tensor_drop = TF.hflip(tensor_drop)
                 tensor_blur = TF.hflip(tensor_blur)
                 tensor_clear = TF.hflip(tensor_clear)
+        else:
+            # 驗證階段：確保長寬是 16 的倍數，以免 U-Net 多層下採樣時維度無法整除而報錯
+            _, h, w = tensor_drop.shape
+            new_h = (h // 16) * 16
+            new_w = (w // 16) * 16
+            tensor_drop = TF.crop(tensor_drop, 0, 0, new_h, new_w)
+            tensor_blur = TF.crop(tensor_blur, 0, 0, new_h, new_w)
+            tensor_clear = TF.crop(tensor_clear, 0, 0, new_h, new_w)
 
         return tensor_drop, tensor_blur, tensor_clear
 
-# ==============================================================================
-# 5. 評估指標 (PSNR)
-# ==============================================================================
 def calculate_psnr(img1, img2):
     mse = torch.mean((img1 - img2) ** 2)
     if mse == 0:
@@ -211,66 +281,58 @@ def calculate_psnr(img1, img2):
     return 20 * math.log10(1.0 / math.sqrt(mse.item()))
 
 # ==============================================================================
-# 6. 主訓練腳本
+# 6. 主訓練流程 (RTX 4090 優化版)
 # ==============================================================================
 def train_model():
-    data_dir = 'D:/gitserver/python/raindrop/dataset/DayRainDrop_Train' 
+    data_dir = './dataset/DayRainDrop_Train' 
     save_dir = './checkpoints'
     
-    batch_size = 8
-    total_target_epochs = 100
-    num_epochs_per_run = 10
+    # RTX 4090 設定：兩套 Deep U-Net 很吃顯存，4 Batch 搭配 384 視野為最佳平衡
+    batch_size = 4
+    crop_size = 384      
+    total_target_epochs = 150
+    num_epochs_per_run = 100
     lr = 2e-4
-    crop_size = 256
 
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_cuda = (device.type == 'cuda')
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動訓練，使用硬體裝置: {device}")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動『究極雙階段』訓練，裝置: {device}")
 
     dataset = TripletRaindropDataset(data_dir, crop_size=crop_size, is_train=True)
     if len(dataset) == 0:
-        print(f"錯誤：於路徑 {data_dir} 未找到訓練圖片！請檢查資料夾路徑。")
+        print(f"錯誤：於路徑 `{data_dir}` 未找到訓練資料集！")
         return
 
     val_size = max(1, int(len(dataset) * 0.1))
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
-    num_workers = 4 if use_cuda else 0
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=batch_size, 
-        shuffle=True, 
-        num_workers=num_workers, 
-        pin_memory=use_cuda
+        train_dataset, batch_size=batch_size, shuffle=True, 
+        num_workers=8 if use_cuda else 0, pin_memory=use_cuda, prefetch_factor=2 if use_cuda else None
     )
-    val_loader = DataLoader(
-        val_dataset, 
-        batch_size=1, 
-        shuffle=False, 
-        num_workers=0
-    )
+    val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2 if use_cuda else 0)
 
-    # 升級至 base_channels = 64
-    model = FastTwoStageRaindropNet(in_channels=3, base_channels=64).to(device)
-    
-    # 定義雙重 Loss：Charbonnier + VGG Perceptual
-    criterion_charb = CharbonnierLoss().to(device)
+    # 實例化究極雙階段網路
+    model = UltimateTwoStageNet(base_channels=64).to(device)
+
+    criterion_pixel = CharbonnierLoss().to(device)
     criterion_vgg = VGGPerceptualLoss().to(device)
+    criterion_fft = FFTLoss().to(device)
+    criterion_grad = EdgeGradientLoss().to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_target_epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
 
-    # Resume 檢查
     latest_ckpt_path = os.path.join(save_dir, 'latest_model.pth')
     start_epoch = 1
     best_psnr = 0.0
 
     if os.path.exists(latest_ckpt_path):
-        print(f"--> 偵測到歷史模型權重，正在讀取: {latest_ckpt_path}")
-        checkpoint = torch.load(latest_ckpt_path, map_location=device)
+        print(f"--> 偵測到既有權重，嘗試讀取: {latest_ckpt_path}")
+        checkpoint = torch.load(latest_ckpt_path, map_location=device, weights_only=False)
         try:
             model.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -279,43 +341,38 @@ def train_model():
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             best_psnr = checkpoint.get('best_psnr', 0.0)
-            print(f"--> 成功恢復進度！將從 Epoch [{start_epoch}] 開始繼續訓練。")
-        except Exception as e:
-            print(f"權重結構可能因模型擴充改變，將從頭 Epoch [1] 開始訓練。")
+            print(f"--> 成功恢復進度！從 Epoch [{start_epoch}] 開始執行。")
+        except Exception:
+            print("因模型從單階段轉為究極雙階段架構，將清空歷史記錄並從 Epoch [1] 重新開始。")
 
     end_epoch = min(start_epoch + num_epochs_per_run - 1, total_target_epochs)
-
-    print(f"本次執行範圍: Epoch [{start_epoch:03d}] -> Epoch [{end_epoch:03d}] (共 {end_epoch - start_epoch + 1} 輪)")
 
     for epoch in range(start_epoch, end_epoch + 1):
         model.train()
         epoch_loss = 0.0
         start_time = time.time()
 
-        train_pbar = tqdm(
-            train_loader, 
-            desc=f"Epoch [{epoch:03d}/{total_target_epochs:03d}]", 
-            leave=False,
-            ncols=100
-        )
+        train_pbar = tqdm(train_loader, desc=f"Epoch [{epoch:03d}/{total_target_epochs:03d}]", leave=False, ncols=100)
 
         for drop, blur, clear in train_pbar:
             drop, blur, clear = drop.to(device), blur.to(device), clear.to(device)
-
             optimizer.zero_grad()
 
-            with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
+            with torch.amp.autocast(device_type=device.type, enabled=use_cuda, dtype=torch.float16):
+                # 同時取得兩階段輸出
                 pred_blur, pred_clear = model(drop)
                 
-                # Charbonnier 像素級損失 (調低 S1 權重)
-                loss_s1 = criterion_charb(pred_blur, blur)
-                loss_s2 = criterion_charb(pred_clear, clear)
+                # Stage 1: 專注於讓預測結果貼近 Dataset 裡的 Blur 圖 (僅計算像素 Loss)
+                loss_s1 = criterion_pixel(pred_blur, blur)
                 
-                # VGG 感知損失 (強迫還原清晰細節與紋理)
-                loss_vgg = criterion_vgg(pred_clear, clear)
+                # Stage 2: 專注於將預測結果還原成完美 Clear (壓上所有高階 Loss)
+                loss_s2_pixel = criterion_pixel(pred_clear, clear)
+                loss_s2_vgg = criterion_vgg(pred_clear, clear)
+                loss_s2_fft = criterion_fft(pred_clear, clear)
+                loss_s2_grad = criterion_grad(pred_clear, clear)
                 
-                # 總 Loss 組合
-                total_loss = 0.1 * loss_s1 + 1.0 * loss_s2 + 0.02 * loss_vgg
+                # 聯合優化權重設定
+                total_loss = (0.5 * loss_s1) + (1.0 * loss_s2_pixel + 0.08 * loss_s2_vgg + 0.10 * loss_s2_fft + 0.10 * loss_s2_grad)
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -328,20 +385,19 @@ def train_model():
         elapsed = time.time() - start_time
         avg_loss = epoch_loss / len(train_loader)
 
-        # 驗證階段
+        # 驗證階段 (以第二階段輸出 Pred_Clear 與 Clear_GT 為評估基準)
         model.eval()
         val_psnr = 0.0
         with torch.no_grad():
             for drop, _, clear in val_loader:
                 drop, clear = drop.to(device), clear.to(device)
-                with torch.amp.autocast(device_type=device.type, enabled=use_cuda):
+                with torch.amp.autocast(device_type=device.type, enabled=use_cuda, dtype=torch.float16):
                     _, pred_clear = model(drop)
                 pred_clear = torch.clamp(pred_clear, 0.0, 1.0)
                 val_psnr += calculate_psnr(pred_clear, clear)
 
         avg_psnr = val_psnr / len(val_loader)
-
-        print(f"Epoch [{epoch:03d}/{total_target_epochs:03d}] | Train Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Time: {elapsed:.1f}s")
+        print(f"Epoch [{epoch:03d}/{total_target_epochs:03d}] | Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Time: {elapsed:.1f}s")
 
         is_best = avg_psnr > best_psnr
         if is_best:
@@ -357,12 +413,9 @@ def train_model():
         }
         
         torch.save(save_dict, latest_ckpt_path)
-
         if is_best:
             torch.save(save_dict, os.path.join(save_dir, 'best_model.pth'))
-            print(f"  --> 創下新紀錄！最佳權重已更新 (Best PSNR: {best_psnr:.2f} dB)")
-
-    print(f"\n[完成] 本次 10 輪訓練結束！進度已儲存至 {latest_ckpt_path}")
+            print(f"  --> 最佳權重已更新！(Best PSNR: {best_psnr:.2f} dB)")
 
 if __name__ == '__main__':
     train_model()
