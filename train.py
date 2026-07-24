@@ -291,7 +291,7 @@ def train_model():
     batch_size = 4
     crop_size = 384      
     total_target_epochs = 150
-    num_epochs_per_run = 100
+    num_epochs_per_run = 9
     lr = 2e-4
 
     os.makedirs(save_dir, exist_ok=True)
