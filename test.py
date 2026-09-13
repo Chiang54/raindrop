@@ -124,7 +124,7 @@ class UltimateTwoStageNet(nn.Module):
 # 3. 測試推論主程式
 # ==============================================================================
 def run_test():
-    checkpoint_path = './checkpoints/latest_model.pth' # 或 best_model.pth
+    checkpoint_path = './checkpoints/best_model.pth' # 或 best_model.pth
     test_input_dir = './testdata/DayRainDrop_Train/Drop'
     output_dir = './results_test'
     
