@@ -18,11 +18,11 @@ class NAFBlock(nn.Module):
     def __init__(self, c, DW_Expand=2, FFN_Expand=2):
         super().__init__()
         dw_channel = c * DW_Expand
-        
+
         self.conv1 = nn.Conv2d(c, dw_channel, 1, 1, 0)
         self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, 1, 1, groups=dw_channel)
         self.sg1 = SimpleGate()
-        
+
         self.sca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(dw_channel // 2, dw_channel // 2, 1, 1, 0)
@@ -71,10 +71,7 @@ class DeepUNetStage(nn.Module):
 
         self.bottleneck = nn.Sequential(NAFBlock(base_channels * 4), NAFBlock(base_channels * 4))
 
-        #  checkerboard artifact nn.ConvTranspose2d(k=2, s=2) 
-        # (resize-convolution)
-        #  Odena et al., 2016Deconvolution and Checkerboard Artifacts
-        # (https://distill.pub/2016/deconv-checkerboard/) 
+        # 修正 checkerboard artifact：與 train.py 同步，改為 resize-convolution
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(base_channels * 4, base_channels * 2, 3, 1, 1)
@@ -113,24 +110,31 @@ class UltimateTwoStageNet(nn.Module):
     def forward(self, x_drop):
         stage1_residual = self.stage1(x_drop)
         pred_blur = x_drop + stage1_residual
-        
+
         stage2_input = torch.cat([x_drop, pred_blur], dim=1)
         stage2_residual = self.stage2(stage2_input)
         pred_clear = pred_blur + stage2_residual
-        
+
         return pred_blur, pred_clear
 
 # ==============================================================================
 # 3. 測試推論主程式
 # ==============================================================================
 def run_test():
-    checkpoint_path = './checkpoints/best_model.pth' # 或 best_model.pth
+    # 與 train.py 的 DATASET_MODE 對應：day 用原本的 ./checkpoints，
+    # night / both 各自讀自己的 ./checkpoints_night、./checkpoints_both，
+    # 方便對三組消融實驗的模型分別產生比對圖與量測 PSNR/SSIM。
+    dataset_mode = os.environ.get('DATASET_MODE', 'day').strip().lower()
+    assert dataset_mode in ('day', 'night', 'both'), f"DATASET_MODE 必須是 day/night/both，收到: {dataset_mode}"
+    ckpt_dir = './checkpoints' if dataset_mode == 'day' else f'./checkpoints_{dataset_mode}'
+
+    checkpoint_path = os.path.join(ckpt_dir, 'best_model.pth')  # 一律用 best_model.pth（依 PSNR+SSIM 綜合分數選出的最佳權重）
     test_input_dir = './testdata/DayRainDrop_Train/Drop'
-    output_dir = './results_test'
-    
+    output_dir = f'./results_test_{dataset_mode}'
+
     os.makedirs(output_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"使用的推論硬體: {device}")
+    print(f"使用的推論硬體: {device}，資料集模式: {dataset_mode}，權重: {checkpoint_path}")
 
     if not os.path.exists(checkpoint_path):
         print(f"錯誤: 找不到模型權重檔 `{checkpoint_path}`。")
@@ -141,13 +145,19 @@ def run_test():
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    
-    print(f"成功載入究極雙階段權重！此權重的 Val PSNR 為: {checkpoint.get('best_psnr', 0.0):.2f} dB")
+
+    ckpt_epoch = checkpoint.get('epoch', '?')
+    ckpt_psnr = checkpoint.get('best_psnr', checkpoint.get('last_psnr', 0.0))
+    ckpt_ssim = checkpoint.get('best_ssim', checkpoint.get('last_ssim', None))
+    if ckpt_ssim is not None:
+        print(f"成功載入究極雙階段權重！(Epoch {ckpt_epoch}) Val PSNR: {ckpt_psnr:.2f} dB, Val SSIM: {ckpt_ssim:.4f}")
+    else:
+        print(f"成功載入究極雙階段權重！(Epoch {ckpt_epoch}) Val PSNR: {ckpt_psnr:.2f} dB（此權重無 SSIM 紀錄，屬於舊版 checkpoint）")
 
     # 搜尋測試圖片
     scene_folders = sorted(os.listdir(test_input_dir))
     test_images = []
-    
+
     for scene in scene_folders[:9]:
         scene_path = os.path.join(test_input_dir, scene)
         if os.path.isdir(scene_path):
@@ -163,7 +173,7 @@ def run_test():
     with torch.no_grad():
         for idx, img_path in enumerate(test_images):
             raw_img = Image.open(img_path).convert('RGB')
-            
+
             # 確保圖片長寬能被 16 整除 (避免 U-Net 降採樣出錯)
             w, h = raw_img.size
             new_w = (w // 16) * 16
@@ -182,7 +192,7 @@ def run_test():
             filename = f"test_ultimate_result_{idx+1:03d}.png"
             save_path = os.path.join(output_dir, filename)
             save_image(compared_result, save_path)
-            
+
             print(f"[{idx+1}/{len(test_images)}] 已生成對比圖: {save_path}")
 
     print(f"\n測試完成！所有對比圖已儲存至 `{output_dir}` 資料夾。")

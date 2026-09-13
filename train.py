@@ -4,7 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from PIL import Image
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
@@ -26,11 +26,11 @@ class NAFBlock(nn.Module):
     def __init__(self, c, DW_Expand=2, FFN_Expand=2):
         super().__init__()
         dw_channel = c * DW_Expand
-        
+
         self.conv1 = nn.Conv2d(c, dw_channel, 1, 1, 0)
         self.conv2 = nn.Conv2d(dw_channel, dw_channel, 3, 1, 1, groups=dw_channel)
         self.sg1 = SimpleGate()
-        
+
         self.sca = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(dw_channel // 2, dw_channel // 2, 1, 1, 0)
@@ -73,10 +73,10 @@ class DeepUNetStage(nn.Module):
         # Encoder
         self.inc = nn.Conv2d(in_channels, base_channels, 3, 1, 1)
         self.enc1 = nn.Sequential(NAFBlock(base_channels), NAFBlock(base_channels))
-        
+
         self.down1 = nn.Conv2d(base_channels, base_channels * 2, 2, 2)
         self.enc2 = nn.Sequential(NAFBlock(base_channels * 2), NAFBlock(base_channels * 2))
-        
+
         self.down2 = nn.Conv2d(base_channels * 2, base_channels * 4, 2, 2)
         self.enc3 = nn.Sequential(NAFBlock(base_channels * 4), NAFBlock(base_channels * 4))
 
@@ -86,10 +86,10 @@ class DeepUNetStage(nn.Module):
         )
 
         # Decoder
-        #  checkerboard artifact nn.ConvTranspose2d(k=2, s=2) 
-        # (resize-convolution)
-        #  Odena et al., 2016Deconvolution and Checkerboard Artifacts
-        # (https://distill.pub/2016/deconv-checkerboard/) 
+        # 修正 checkerboard artifact：原本的 nn.ConvTranspose2d(k=2, s=2) 改為
+        # 「先最近鄰上採樣、再用一般卷積平滑」(resize-convolution)，
+        # 這是 Odena et al., 2016《Deconvolution and Checkerboard Artifacts》
+        # (https://distill.pub/2016/deconv-checkerboard/) 提出的標準解法。
         self.up2 = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(base_channels * 4, base_channels * 2, 3, 1, 1)
@@ -122,7 +122,7 @@ class DeepUNetStage(nn.Module):
         d1 = self.dec1(self.reduce1(d1))
 
         # 這裡不加原圖 x，因為可能是從 6 channel 壓回 3 channel
-        output = self.outc(d1) 
+        output = self.outc(d1)
         return output
 
 # ==============================================================================
@@ -133,7 +133,7 @@ class UltimateTwoStageNet(nn.Module):
         super().__init__()
         # Stage 1: 輸入 Drop (3 ch)，輸出預測的 Blur (3 ch)
         self.stage1 = DeepUNetStage(in_channels=3, out_channels=3, base_channels=base_channels)
-        
+
         # Stage 2: 輸入 Drop + 預測的 Blur (6 ch)，輸出最終清晰圖 Clear (3 ch)
         self.stage2 = DeepUNetStage(in_channels=6, out_channels=3, base_channels=base_channels)
 
@@ -141,12 +141,12 @@ class UltimateTwoStageNet(nn.Module):
         # 階段一：去除雨滴，生成模糊背景
         stage1_residual = self.stage1(x_drop)
         pred_blur = x_drop + stage1_residual  # 殘差連線
-        
+
         # 階段二：將原始雨滴圖與去雨滴後的圖融合，進行去模糊與幾何銳化
         stage2_input = torch.cat([x_drop, pred_blur], dim=1)
         stage2_residual = self.stage2(stage2_input)
         pred_clear = pred_blur + stage2_residual # 基於 Blur 進行清晰化還原
-        
+
         return pred_blur, pred_clear
 
 # ==============================================================================
@@ -201,6 +201,49 @@ class EdgeGradientLoss(nn.Module):
         grad_y_gt = F.conv2d(y, self.kernel_y, padding=1, groups=3)
         return F.l1_loss(grad_x_pred, grad_x_gt) + F.l1_loss(grad_y_pred, grad_y_gt)
 
+class SSIMMetric(nn.Module):
+    """
+    標準單尺度 SSIM（11x11 高斯窗），純 torch 實作、不需額外套件。
+    用於訓練時的驗證指標（PSNR 容易偏好「平滑模糊但像素誤差小」的結果，
+    SSIM 對結構/銳利度更敏感，兩者一起看才不會選到偏模糊的權重）。
+    """
+    def __init__(self, window_size=11, sigma=1.5):
+        super().__init__()
+        self.window_size = window_size
+        self.sigma = sigma
+        self.register_buffer('_window_cache', self._create_window(window_size, sigma, 3), persistent=False)
+        self._cached_channels = 3
+
+    def _gaussian(self, window_size, sigma):
+        coords = torch.arange(window_size, dtype=torch.float32) - window_size // 2
+        g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+        return g / g.sum()
+
+    def _create_window(self, window_size, sigma, channel):
+        g_1d = self._gaussian(window_size, sigma).unsqueeze(1)
+        g_2d = g_1d.mm(g_1d.t()).unsqueeze(0).unsqueeze(0)
+        return g_2d.expand(channel, 1, window_size, window_size).contiguous()
+
+    def forward(self, img1, img2):
+        channel = img1.size(1)
+        if channel != self._cached_channels or self._window_cache.dtype != img1.dtype:
+            self._window_cache = self._create_window(self.window_size, self.sigma, channel).to(img1.device, img1.dtype)
+            self._cached_channels = channel
+        window = self._window_cache
+        pad = self.window_size // 2
+
+        mu1 = F.conv2d(img1, window, padding=pad, groups=channel)
+        mu2 = F.conv2d(img2, window, padding=pad, groups=channel)
+        mu1_sq, mu2_sq, mu1_mu2 = mu1 * mu1, mu2 * mu2, mu1 * mu2
+
+        sigma1_sq = F.conv2d(img1 * img1, window, padding=pad, groups=channel) - mu1_sq
+        sigma2_sq = F.conv2d(img2 * img2, window, padding=pad, groups=channel) - mu2_sq
+        sigma12 = F.conv2d(img1 * img2, window, padding=pad, groups=channel) - mu1_mu2
+
+        C1, C2 = 0.01 ** 2, 0.03 ** 2
+        ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+        return ssim_map.mean()
+
 # ==============================================================================
 # 5. 三檔案聯合載入 Dataset (Drop, Blur, Clear 同步增強)
 # ==============================================================================
@@ -208,11 +251,11 @@ class TripletRaindropDataset(Dataset):
     def __init__(self, root_dir, crop_size=384, is_train=True):
         self.crop_size = crop_size
         self.is_train = is_train
-        
+
         self.drop_dir = os.path.join(root_dir, 'Drop')
         self.blur_dir = os.path.join(root_dir, 'Blur')
         self.clear_dir = os.path.join(root_dir, 'Clear')
-        
+
         self.image_triplets = []
         if os.path.exists(self.drop_dir):
             scene_folders = sorted(os.listdir(self.drop_dir))
@@ -231,11 +274,11 @@ class TripletRaindropDataset(Dataset):
 
     def __getitem__(self, idx):
         drop_path, blur_path, clear_path = self.image_triplets[idx]
-        
+
         img_drop = Image.open(drop_path).convert('RGB')
         img_blur = Image.open(blur_path).convert('RGB')
         img_clear = Image.open(clear_path).convert('RGB')
-        
+
         tensor_drop = TF.to_tensor(img_drop)
         tensor_blur = TF.to_tensor(img_blur)
         tensor_clear = TF.to_tensor(img_clear)
@@ -294,12 +337,24 @@ def calculate_psnr(img1, img2):
 # 6. 主訓練流程 (RTX 4090 優化版)
 # ==============================================================================
 def train_model():
-    data_dir = './dataset/DayRainDrop_Train' 
-    save_dir = './checkpoints'
-    
+    # ----------------------------------------------------------------------
+    # 資料集模式切換：'day' | 'night' | 'both'
+    # 用來跑論文需要的消融實驗（單日間 vs 單夜間 vs 日夜合併），
+    # 可用環境變數覆寫，例如：DATASET_MODE=night python3 train.py
+    # ----------------------------------------------------------------------
+    DATASET_MODE = os.environ.get('DATASET_MODE', 'both').strip().lower()
+    assert DATASET_MODE in ('day', 'night', 'both'), f"DATASET_MODE 必須是 day/night/both，收到: {DATASET_MODE}"
+
+    day_dir = './dataset/DayRainDrop_Train'
+    night_dir = './dataset/NightRainDrop_Train'
+
+    # day-only 沿用原本的 ./checkpoints（既有的 Epoch150 訓練成果，等同這次消融實驗的
+    # 「day-only」那組數據，不用重跑），night / both 各自存到獨立資料夾，避免互相覆蓋。
+    save_dir = './checkpoints' if DATASET_MODE == 'day' else f'./checkpoints_{DATASET_MODE}'
+
     # RTX 4090 設定：兩套 Deep U-Net 很吃顯存，4 Batch 搭配 384 視野為最佳平衡
     batch_size = 4
-    crop_size = 384      
+    crop_size = 384
     total_target_epochs = 150
     num_epochs_per_run = 9
     lr = 2e-4
@@ -307,19 +362,36 @@ def train_model():
     os.makedirs(save_dir, exist_ok=True)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     use_cuda = (device.type == 'cuda')
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動『究極雙階段』訓練，裝置: {device}")
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 啟動『究極雙階段』訓練，裝置: {device}，資料集模式: {DATASET_MODE}，權重存放: {save_dir}")
 
-    dataset = TripletRaindropDataset(data_dir, crop_size=crop_size, is_train=True)
-    if len(dataset) == 0:
-        print(f"錯誤：於路徑 `{data_dir}` 未找到訓練資料集！")
+    # ----------------------------------------------------------------------
+    # 依 DATASET_MODE 組出訓練資料集（day / night / 兩者合併 ConcatDataset）
+    # ----------------------------------------------------------------------
+    sub_datasets = []
+    if DATASET_MODE in ('day', 'both'):
+        d = TripletRaindropDataset(day_dir, crop_size=crop_size, is_train=True)
+        print(f"  --> Day 資料集：{len(d)} 筆（{day_dir}）")
+        if len(d) > 0:
+            sub_datasets.append(d)
+    if DATASET_MODE in ('night', 'both'):
+        d = TripletRaindropDataset(night_dir, crop_size=crop_size, is_train=True)
+        print(f"  --> Night 資料集：{len(d)} 筆（{night_dir}）")
+        if len(d) > 0:
+            sub_datasets.append(d)
+
+    if len(sub_datasets) == 0:
+        print(f"錯誤：找不到訓練資料集！請確認 DATASET_MODE={DATASET_MODE} 對應的資料夾存在。")
         return
+
+    dataset = sub_datasets[0] if len(sub_datasets) == 1 else ConcatDataset(sub_datasets)
+    print(f"  --> 合併後總計：{len(dataset)} 筆訓練樣本")
 
     val_size = max(1, int(len(dataset) * 0.1))
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
 
     train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, 
+        train_dataset, batch_size=batch_size, shuffle=True,
         num_workers=8 if use_cuda else 0, pin_memory=use_cuda, prefetch_factor=2 if use_cuda else None
     )
     val_loader = DataLoader(val_dataset, batch_size=1, shuffle=False, num_workers=2 if use_cuda else 0)
@@ -331,6 +403,7 @@ def train_model():
     criterion_vgg = VGGPerceptualLoss().to(device)
     criterion_fft = FFTLoss().to(device)
     criterion_grad = EdgeGradientLoss().to(device)
+    metric_ssim = SSIMMetric().to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_target_epochs, eta_min=1e-6)
@@ -339,6 +412,8 @@ def train_model():
     latest_ckpt_path = os.path.join(save_dir, 'latest_model.pth')
     start_epoch = 1
     best_psnr = 0.0
+    best_ssim = 0.0
+    best_combined = 0.0
 
     if os.path.exists(latest_ckpt_path):
         print(f"--> 偵測到既有權重，嘗試讀取: {latest_ckpt_path}")
@@ -351,9 +426,11 @@ def train_model():
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
             start_epoch = checkpoint['epoch'] + 1
             best_psnr = checkpoint.get('best_psnr', 0.0)
+            best_ssim = checkpoint.get('best_ssim', 0.0)
+            best_combined = checkpoint.get('best_combined', 0.0)
             print(f"--> 成功恢復進度！從 Epoch [{start_epoch}] 開始執行。")
         except Exception:
-            print("因模型從單階段轉為究極雙階段架構，將清空歷史記錄並從 Epoch [1] 重新開始。")
+            print("因模型架構或輸入資料改變（例如新加入 Night 資料集），將清空歷史記錄並從 Epoch [1] 重新開始。")
 
     end_epoch = min(start_epoch + num_epochs_per_run - 1, total_target_epochs)
 
@@ -371,18 +448,27 @@ def train_model():
             with torch.amp.autocast(device_type=device.type, enabled=use_cuda, dtype=torch.float16):
                 # 同時取得兩階段輸出
                 pred_blur, pred_clear = model(drop)
-                
-                # Stage 1: 專注於讓預測結果貼近 Dataset 裡的 Blur 圖 (僅計算像素 Loss)
-                loss_s1 = criterion_pixel(pred_blur, blur)
-                
-                # Stage 2: 專注於將預測結果還原成完美 Clear (壓上所有高階 Loss)
+
+                # Stage 1: 原本只用 pixel loss，容易讓小雨滴/細紋殘留（只要像素數值大致
+                # 對上就過關，對局部小面積的雨滴痕跡懲罰不夠）。加入輕量的感知/梯度損失，
+                # 逼 Stage 1 把雨滴的「結構」也清乾淨，而不只是顏色數值對。
+                loss_s1_pixel = criterion_pixel(pred_blur, blur)
+                loss_s1_vgg = criterion_vgg(pred_blur, blur)
+                loss_s1_grad = criterion_grad(pred_blur, blur)
+                loss_s1 = loss_s1_pixel + 0.05 * loss_s1_vgg + 0.05 * loss_s1_grad
+
+                # Stage 2: 拉高 VGG 感知損失與梯度損失的權重（原本 0.08 / 0.10 太小，
+                # 幾乎被 pixel loss 主導，這是輸出整體偏模糊的主因——純像素回歸損失
+                # 對不確定的高頻細節會傾向「取平均」而不是「猜一個銳利的答案」）。
                 loss_s2_pixel = criterion_pixel(pred_clear, clear)
                 loss_s2_vgg = criterion_vgg(pred_clear, clear)
                 loss_s2_fft = criterion_fft(pred_clear, clear)
                 loss_s2_grad = criterion_grad(pred_clear, clear)
-                
-                # 聯合優化權重設定
-                total_loss = (0.5 * loss_s1) + (1.0 * loss_s2_pixel + 0.08 * loss_s2_vgg + 0.10 * loss_s2_fft + 0.10 * loss_s2_grad)
+
+                # 聯合優化權重設定（v2：拉高感知/梯度權重，降低對純像素損失的依賴）
+                total_loss = (0.5 * loss_s1) + (
+                    1.0 * loss_s2_pixel + 0.25 * loss_s2_vgg + 0.10 * loss_s2_fft + 0.25 * loss_s2_grad
+                )
 
             scaler.scale(total_loss).backward()
             scaler.step(optimizer)
@@ -395,37 +481,51 @@ def train_model():
         elapsed = time.time() - start_time
         avg_loss = epoch_loss / len(train_loader)
 
-        # 驗證階段 (以第二階段輸出 Pred_Clear 與 Clear_GT 為評估基準)
+        # 驗證階段 (以第二階段輸出 Pred_Clear 與 Clear_GT 為評估基準，同時算 PSNR + SSIM)
         model.eval()
         val_psnr = 0.0
+        val_ssim = 0.0
         with torch.no_grad():
             for drop, _, clear in val_loader:
                 drop, clear = drop.to(device), clear.to(device)
                 with torch.amp.autocast(device_type=device.type, enabled=use_cuda, dtype=torch.float16):
                     _, pred_clear = model(drop)
-                pred_clear = torch.clamp(pred_clear, 0.0, 1.0)
-                val_psnr += calculate_psnr(pred_clear, clear)
+                pred_clear = torch.clamp(pred_clear, 0.0, 1.0).float()
+                clear_f = clear.float()
+                val_psnr += calculate_psnr(pred_clear, clear_f)
+                val_ssim += metric_ssim(pred_clear, clear_f).item()
 
         avg_psnr = val_psnr / len(val_loader)
-        print(f"Epoch [{epoch:03d}/{total_target_epochs:03d}] | Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Time: {elapsed:.1f}s")
+        avg_ssim = val_ssim / len(val_loader)
+        # PSNR 常見上限抓 40dB 做正規化，跟 0~1 的 SSIM 各佔一半權重，
+        # 避免單獨用 PSNR 選模型時，選到「模糊但像素誤差小」的權重（這正是這次遇到的問題）。
+        combined_score = 0.5 * (avg_psnr / 40.0) + 0.5 * avg_ssim
+        print(f"Epoch [{epoch:03d}/{total_target_epochs:03d}] | Loss: {avg_loss:.4f} | Val PSNR: {avg_psnr:.2f} dB | Val SSIM: {avg_ssim:.4f} | Time: {elapsed:.1f}s")
 
-        is_best = avg_psnr > best_psnr
+        is_best = combined_score > best_combined
         if is_best:
+            best_combined = combined_score
             best_psnr = avg_psnr
+            best_ssim = avg_ssim
 
         save_dict = {
             'epoch': epoch,
+            'dataset_mode': DATASET_MODE,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict() if use_cuda else None,
             'best_psnr': best_psnr,
+            'best_ssim': best_ssim,
+            'best_combined': best_combined,
+            'last_psnr': avg_psnr,
+            'last_ssim': avg_ssim,
         }
-        
+
         torch.save(save_dict, latest_ckpt_path)
         if is_best:
             torch.save(save_dict, os.path.join(save_dir, 'best_model.pth'))
-            print(f"  --> 最佳權重已更新！(Best PSNR: {best_psnr:.2f} dB)")
+            print(f"  --> 最佳權重已更新！(Best PSNR: {best_psnr:.2f} dB, Best SSIM: {best_ssim:.4f})")
 
 if __name__ == '__main__':
     train_model()
