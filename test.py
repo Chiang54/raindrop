@@ -71,11 +71,21 @@ class DeepUNetStage(nn.Module):
 
         self.bottleneck = nn.Sequential(NAFBlock(base_channels * 4), NAFBlock(base_channels * 4))
 
-        self.up2 = nn.ConvTranspose2d(base_channels * 4, base_channels * 2, 2, 2)
+        #  checkerboard artifact nn.ConvTranspose2d(k=2, s=2) 
+        # (resize-convolution)
+        #  Odena et al., 2016Deconvolution and Checkerboard Artifacts
+        # (https://distill.pub/2016/deconv-checkerboard/) 
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 4, base_channels * 2, 3, 1, 1)
+        )
         self.reduce2 = nn.Conv2d(base_channels * 4, base_channels * 2, 1)
         self.dec2 = nn.Sequential(NAFBlock(base_channels * 2), NAFBlock(base_channels * 2))
 
-        self.up1 = nn.ConvTranspose2d(base_channels * 2, base_channels, 2, 2)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(base_channels * 2, base_channels, 3, 1, 1)
+        )
         self.reduce1 = nn.Conv2d(base_channels * 2, base_channels, 1)
         self.dec1 = nn.Sequential(NAFBlock(base_channels), NAFBlock(base_channels))
 
