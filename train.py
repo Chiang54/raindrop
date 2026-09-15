@@ -267,6 +267,8 @@ class TripletRaindropDataset(Dataset):
                         blur_path = os.path.join(self.blur_dir, scene, img_name)
                         clear_path = os.path.join(self.clear_dir, scene, img_name)
                         if os.path.exists(clear_path) and os.path.exists(blur_path):
+                            if os.path.normpath(drop_path).endswith(os.path.normpath('NightRainDrop_Train/Drop/00069/00013.png')):
+                                continue  # NFS
                             self.image_triplets.append((drop_path, blur_path, clear_path))
 
     def __len__(self):
