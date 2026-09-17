@@ -161,7 +161,7 @@ def run_test():
     for scene in scene_folders[:9]:
         scene_path = os.path.join(test_input_dir, scene)
         if os.path.isdir(scene_path):
-            imgs = glob.glob(os.path.join(scene_path, '*.png')) + glob.glob(os.path.join(scene_path, '*.jpg'))
+            imgs = sorted(glob.glob(os.path.join(scene_path, '*.png')) + glob.glob(os.path.join(scene_path, '*.jpg')))  # sorted()  DATASET_MODE 
             test_images.extend(imgs[:5])
 
     if not test_images:

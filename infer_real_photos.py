@@ -44,3 +44,5 @@ if __name__ == '__main__':
     print('Photos found:', photos)
     out_dir = 'testdata/real_photo_results'
     run('day', './checkpoints', photos, out_dir)
+    run('both', './checkpoints_both', photos, out_dir)
+    run('night', './checkpoints_night', photos, out_dir)
